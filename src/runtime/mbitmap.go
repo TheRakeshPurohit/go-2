@@ -535,12 +535,13 @@ func bulkBarrierPreWriteSrcOnly(dst, src, size uintptr, typ *abi.Type) {
 }
 
 // initHeapBits initializes the heap bitmap for a span.
-//
-// TODO(mknyszek): This should set the heap bits for single pointer
-// allocations eagerly to avoid calling heapSetType at allocation time,
-// just to write one bit.
-func (s *mspan) initHeapBits(forceClear bool) {
-	if (!s.spanclass.noscan() && heapBitsInSpan(s.elemsize)) || s.isUserArenaChunk {
+func (s *mspan) initHeapBits() {
+	if goarch.PtrSize == 8 && !s.spanclass.noscan() && s.spanclass.sizeclass() == 1 {
+		b := s.heapBits()
+		for i := range b {
+			b[i] = ^uintptr(0)
+		}
+	} else if (!s.spanclass.noscan() && heapBitsInSpan(s.elemsize)) || s.isUserArenaChunk {
 		b := s.heapBits()
 		clear(b)
 	}
@@ -639,17 +640,20 @@ func (span *mspan) heapBitsSmallForAddr(addr uintptr) uintptr {
 //
 //go:nosplit
 func (span *mspan) writeHeapBitsSmall(x, dataSize uintptr, typ *_type) (scanSize uintptr) {
+	if goarch.PtrSize == 8 && dataSize == goarch.PtrSize {
+		// Already set by initHeapBits.
+		return
+	}
+
 	// The objects here are always really small, so a single load is sufficient.
 	src0 := readUintptr(typ.GCData)
 
-	// Create repetitions of the bitmap if we have a small array.
-	bits := span.elemsize / goarch.PtrSize
+	// Create repetitions of the bitmap if we have a small slice backing store.
 	scanSize = typ.PtrBytes
 	src := src0
-	switch typ.Size_ {
-	case goarch.PtrSize:
+	if typ.Size_ == goarch.PtrSize {
 		src = (1 << (dataSize / goarch.PtrSize)) - 1
-	default:
+	} else {
 		for i := typ.Size_; i < dataSize; i += typ.Size_ {
 			src |= src0 << (i / goarch.PtrSize)
 			scanSize += typ.Size_
@@ -658,19 +662,23 @@ func (span *mspan) writeHeapBitsSmall(x, dataSize uintptr, typ *_type) (scanSize
 
 	// Since we're never writing more than one uintptr's worth of bits, we're either going
 	// to do one or two writes.
-	dst := span.heapBits()
+	dst := unsafe.Pointer(span.base() + pageSize - pageSize/goarch.PtrSize/8)
 	o := (x - span.base()) / goarch.PtrSize
 	i := o / ptrBits
 	j := o % ptrBits
+	bits := span.elemsize / goarch.PtrSize
 	if j+bits > ptrBits {
 		// Two writes.
 		bits0 := ptrBits - j
 		bits1 := bits - bits0
-		dst[i+0] = dst[i+0]&(^uintptr(0)>>bits0) | (src << j)
-		dst[i+1] = dst[i+1]&^((1<<bits1)-1) | (src >> bits0)
+		dst0 := (*uintptr)(add(dst, (i+0)*goarch.PtrSize))
+		dst1 := (*uintptr)(add(dst, (i+1)*goarch.PtrSize))
+		*dst0 = (*dst0)&(^uintptr(0)>>bits0) | (src << j)
+		*dst1 = (*dst1)&^((1<<bits1)-1) | (src >> bits0)
 	} else {
 		// One write.
-		dst[i] = (dst[i] &^ (((1 << bits) - 1) << j)) | (src << j)
+		dst := (*uintptr)(add(dst, i*goarch.PtrSize))
+		*dst = (*dst)&^(((1<<bits)-1)<<j) | (src << j)
 	}
 
 	const doubleCheck = false
